@@ -394,6 +394,94 @@ func TestGetProjectDetail_MetricsAggregatesTerminalRuns(t *testing.T) {
 	}
 }
 
+func TestGetProjectDetail_StageMetricsUseLatestTenAndExcludeApprovalWait(t *testing.T) {
+	pool := dbtest.SetupPool(t)
+	s := store.New(pool)
+	ctx := context.Background()
+
+	pipelineID, materialID, _ := seedPipeline(t, pool, false)
+	now := time.Now().UTC()
+	for i := 0; i < 11; i++ {
+		in := baseTriggerInput(pipelineID, materialID, int64(i+1))
+		in.Revision = fmt.Sprintf("%040x", i+1)
+		run, err := s.CreateRunFromModification(ctx, in)
+		if err != nil {
+			t.Fatalf("create run %d: %v", i+1, err)
+		}
+
+		// The oldest sample is a dirty 1,000-second outlier. The ten newer
+		// builds take 50 seconds in each stage, so a last-ten p95 is exactly
+		// 50 rather than being pulled upward by old history.
+		stageSec := 50
+		if i == 0 {
+			stageSec = 1000
+		}
+		created := now.Add(time.Duration(i-11) * time.Minute)
+		start := created
+		mid := start.Add(time.Duration(stageSec) * time.Second)
+		end := mid.Add(time.Duration(stageSec) * time.Second)
+		if _, err := pool.Exec(ctx, `
+			UPDATE runs
+			SET status='success', created_at=$1, started_at=$2, finished_at=$3
+			WHERE id=$4`, created, start, end, run.RunID); err != nil {
+			t.Fatalf("finish run %d: %v", i+1, err)
+		}
+		if _, err := pool.Exec(ctx, `
+			UPDATE stage_runs
+			SET status='success', started_at=$1,
+			    finished_at=CASE WHEN ordinal=0 THEN $2::timestamptz ELSE $3::timestamptz END
+			WHERE run_id=$4`, start, mid, end, run.RunID); err != nil {
+			t.Fatalf("finish stages for run %d: %v", i+1, err)
+		}
+		if _, err := pool.Exec(ctx, `
+			UPDATE stage_runs
+			SET started_at=$1
+			WHERE run_id=$2 AND ordinal=1`, mid, run.RunID); err != nil {
+			t.Fatalf("start approval stage for run %d: %v", i+1, err)
+		}
+		if _, err := pool.Exec(ctx, `
+			UPDATE job_runs jr
+			SET approval_gate=true
+			FROM stage_runs sr
+			WHERE jr.stage_run_id=sr.id AND sr.run_id=$1 AND sr.ordinal=1`, run.RunID); err != nil {
+			t.Fatalf("mark approval gate for run %d: %v", i+1, err)
+		}
+	}
+
+	got, err := s.GetProjectDetail(ctx, "demo", 10)
+	if err != nil {
+		t.Fatalf("GetProjectDetail: %v", err)
+	}
+	m := got.Pipelines[0].Metrics
+	if m == nil {
+		t.Fatal("Metrics nil after terminal runs")
+	}
+	if len(m.StageStats) != 1 {
+		t.Fatalf("StageStats = %+v, want only the build stage", m.StageStats)
+	}
+	stat := m.StageStats[0]
+	if stat.Name != "build" {
+		t.Fatalf("stage = %q, want build", stat.Name)
+	}
+	if stat.RunsConsidered != 10 {
+		t.Fatalf("RunsConsidered = %d, want 10", stat.RunsConsidered)
+	}
+	if stat.DurationP95Sec != 50 {
+		t.Fatalf("DurationP95Sec = %v, want 50 from the latest ten builds", stat.DurationP95Sec)
+	}
+	if m.ProcessTimeP50Sec != 50 {
+		t.Fatalf("ProcessTimeP50Sec = %v, want 50 without approval wait", m.ProcessTimeP50Sec)
+	}
+
+	projects, err := s.ListProjects(ctx)
+	if err != nil {
+		t.Fatalf("ListProjects: %v", err)
+	}
+	if projects[0].Metrics == nil || projects[0].Metrics.ProcessTimeP50Sec != 50 {
+		t.Fatalf("project ProcessTimeP50Sec = %+v, want 50 without approval wait", projects[0].Metrics)
+	}
+}
+
 func TestGetRunDetail_NotFound(t *testing.T) {
 	pool := dbtest.SetupPool(t)
 	s := store.New(pool)

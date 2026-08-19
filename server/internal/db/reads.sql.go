@@ -1094,6 +1094,15 @@ WITH per_run AS (
                 FROM stage_runs sr
                 WHERE sr.run_id = r.id
                   AND sr.finished_at IS NOT NULL AND sr.started_at IS NOT NULL
+                  -- Keep process time aligned with ProjectMetricsAggregated:
+                  -- approval gates measure human/QA wait, not compute.
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM job_runs jr
+                      WHERE jr.run_id = r.id
+                        AND jr.stage_run_id = sr.id
+                        AND jr.approval_gate = true
+                  )
            ), 0)::double precision AS process_s
     FROM runs r
     JOIN pipelines pl ON pl.id = r.pipeline_id
@@ -1158,18 +1167,39 @@ func (q *Queries) PipelineMetricsByProjectSlug(ctx context.Context, arg Pipeline
 }
 
 const pipelineStageMetricsByProjectSlug = `-- name: PipelineStageMetricsByProjectSlug :many
-WITH scope AS (
-    SELECT r.pipeline_id, sr.name AS stage_name, sr.status AS stage_status,
-           EXTRACT(EPOCH FROM (sr.finished_at - sr.started_at))::double precision AS duration_s
-    FROM runs r
-    JOIN pipelines pl ON pl.id = r.pipeline_id
+WITH recent_runs AS (
+    SELECT pl.id AS pipeline_id, recent.id AS run_id
+    FROM pipelines pl
     JOIN projects p ON p.id = pl.project_id
-    JOIN stage_runs sr ON sr.run_id = r.id
+    CROSS JOIN LATERAL (
+        SELECT r.id
+        FROM runs r
+        WHERE r.pipeline_id = pl.id
+          AND r.status IN ('success','failed','canceled','skipped')
+        -- idx_runs_pipeline_counter makes this ten index entries per pipeline,
+        -- rather than a scan of cumulative run history.
+        ORDER BY r.counter DESC
+        LIMIT $2
+    ) recent
     WHERE p.slug = $1
-      AND r.created_at >= now() - $2::interval
-      AND sr.started_at IS NOT NULL
+), scope AS (
+    SELECT recent.pipeline_id, sr.name AS stage_name, sr.status AS stage_status,
+           EXTRACT(EPOCH FROM (sr.finished_at - sr.started_at))::double precision AS duration_s
+    FROM recent_runs recent
+    JOIN stage_runs sr ON sr.run_id = recent.run_id
+    WHERE sr.started_at IS NOT NULL
       AND sr.finished_at IS NOT NULL
       AND sr.status IN ('success','failed','canceled','skipped')
+      -- idx_job_runs_run_id makes this anti-join proportional to jobs in the
+      -- candidate run (normally O(1), bounded by its pipeline definition)
+      -- rather than cumulative job history.
+      AND NOT EXISTS (
+          SELECT 1
+          FROM job_runs jr
+          WHERE jr.run_id = recent.run_id
+            AND jr.stage_run_id = sr.id
+            AND jr.approval_gate = true
+      )
 )
 SELECT pipeline_id,
        stage_name,
@@ -1184,7 +1214,7 @@ ORDER BY pipeline_id, stage_name
 
 type PipelineStageMetricsByProjectSlugParams struct {
 	Slug        string
-	SinceWindow pgtype.Interval
+	SampleLimit int32
 }
 
 type PipelineStageMetricsByProjectSlugRow struct {
@@ -1196,13 +1226,12 @@ type PipelineStageMetricsByProjectSlugRow struct {
 	DurationP95S   float64
 }
 
-// Per-stage aggregates over the same window. Feeds the card's
-// per-stage duration percentiles and bottleneck call-out (success
-// rate under threshold). Only terminal stage_runs count — a
-// running/cancelled stage without finished_at would poison the
-// median.
+// Per-stage aggregates over the latest N terminal builds for each pipeline.
+// A conditional stage may therefore have fewer than N samples. Approval stages
+// are excluded: their wall time is human/QA wait, not compute, and cannot be
+// split reliably from the stage timestamps after the fact.
 func (q *Queries) PipelineStageMetricsByProjectSlug(ctx context.Context, arg PipelineStageMetricsByProjectSlugParams) ([]PipelineStageMetricsByProjectSlugRow, error) {
-	rows, err := q.db.Query(ctx, pipelineStageMetricsByProjectSlug, arg.Slug, arg.SinceWindow)
+	rows, err := q.db.Query(ctx, pipelineStageMetricsByProjectSlug, arg.Slug, arg.SampleLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -1237,6 +1266,16 @@ WITH per_run AS (
                 FROM stage_runs sr
                 WHERE sr.run_id = r.id
                   AND sr.finished_at IS NOT NULL AND sr.started_at IS NOT NULL
+                  -- Approval stages are human wait, not compute. The run_id
+                  -- predicate lets idx_job_runs_run_id bound the anti-join to
+                  -- the handful of jobs in this run before matching stage_id.
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM job_runs jr
+                      WHERE jr.run_id = r.id
+                        AND jr.stage_run_id = sr.id
+                        AND jr.approval_gate = true
+                  )
            ), 0)::double precision AS process_s
     FROM runs r
     JOIN pipelines pl ON pl.id = r.pipeline_id

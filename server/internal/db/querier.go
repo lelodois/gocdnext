@@ -1763,11 +1763,10 @@ type Querier interface {
 	// the per-run sum of stage_run durations (actual busy time),
 	// distinct from `lead_time_p50_seconds` (wall-clock run duration).
 	PipelineMetricsByProjectSlug(ctx context.Context, arg PipelineMetricsByProjectSlugParams) ([]PipelineMetricsByProjectSlugRow, error)
-	// Per-stage aggregates over the same window. Feeds the card's
-	// per-stage duration percentiles and bottleneck call-out (success
-	// rate under threshold). Only terminal stage_runs count — a
-	// running/cancelled stage without finished_at would poison the
-	// median.
+	// Per-stage aggregates over the latest N terminal builds for each pipeline.
+	// A conditional stage may therefore have fewer than N samples. Approval stages
+	// are excluded: their wall time is human/QA wait, not compute, and cannot be
+	// split reliably from the stage timestamps after the fact.
 	PipelineStageMetricsByProjectSlug(ctx context.Context, arg PipelineStageMetricsByProjectSlugParams) ([]PipelineStageMetricsByProjectSlugRow, error)
 	// Per-project roll-up of terminal runs over the last $1 interval.
 	// Same math as PipelineMetricsByProjectSlug but grouped by project
